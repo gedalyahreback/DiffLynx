@@ -1,10 +1,12 @@
 <p align="center">
-  <img src="logo.png" alt="gemini-docs-watcher logo" width="200"/>
+  <img src="logo.png" alt="DiffLynx logo" width="200"/>
 </p>
 
-# gemini-docs-watcher
+# DiffLynx
 
 Monitors all sub-pages under multiple docs sites for content changes and sends alerts via Gmail and Slack.
+
+> Previously known as **Gemini Docs Watcher** and **Foreign Docs Watcher**.
 
 ## Setup
 
