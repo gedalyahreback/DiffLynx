@@ -1,4 +1,5 @@
 .env
+personal_config.py
 snapshot.json
 __pycache__/
 *.pyc

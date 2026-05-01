@@ -6,14 +6,12 @@
 
 Monitors all sub-pages under multiple docs sites for content changes and sends alerts via Gmail and Slack.
 
-> Previously known as **Gemini Docs Watcher** and **Foreign Docs Watcher**.
-
 ## Setup
 
 **1. Install dependencies**
 
 ```bash
-cd /Users/gedalyahreback/Agentic/gemini-docs-watcher
+cd /path/to/DiffLynx
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -32,19 +30,23 @@ Fill in `.env` with your values:
 - `WATCH_URLS` — comma-separated list of docs base URLs to crawl. All linked sub-pages under each URL are discovered automatically.
 - `ALERT_MODE` — `per-site` (default) or `digest`. See Alert Modes below.
 
-## Sites monitored by default
+## Configuring sites to monitor
 
-The following URLs are used when `WATCH_URLS` is not set in `.env`:
+Set `WATCH_URLS` in `.env` as a comma-separated list of base URLs:
 
 ```
-https://geminicli.com/docs/
-https://docs.tabnine.com
-https://docs.github.com/en/copilot
-https://cursor.com/docs
-https://gitbook.com/docs
-https://docs.slack.dev/
-https://code.claude.com/docs/en/overview
-https://developers.openai.com/codex
+WATCH_URLS=https://docs.example.com/,https://another-site.com/docs/
+```
+
+All linked sub-pages under each base URL are discovered and monitored automatically.
+
+Alternatively, create a `personal_config.py` file in the project root (it is gitignored) to set your defaults in Python:
+
+```python
+WATCH_URLS = [
+    "https://docs.example.com/",
+    "https://another-site.com/docs/",
+]
 ```
 
 ## Alert modes
@@ -98,10 +100,10 @@ If you are upgrading from the single-site version, the old `snapshot.json` (flat
 
 ## Scheduling with cron (daily at 8 AM)
 
-Run `crontab -e` and add:
+Run `crontab -e` and add (adjusting the path to your installation):
 
 ```
-0 8 * * * cd /Users/gedalyahreback/Agentic/gemini-docs-watcher && /Users/gedalyahreback/Agentic/gemini-docs-watcher/.venv/bin/python3 watcher.py >> /Users/gedalyahreback/Agentic/gemini-docs-watcher/watcher.log 2>&1
+0 8 * * * cd /path/to/DiffLynx && /path/to/DiffLynx/.venv/bin/python3 watcher.py >> /path/to/DiffLynx/watcher.log 2>&1
 ```
 
 ## Slack slash command server
@@ -124,6 +126,35 @@ The server listens on port 3000 for `POST /slack/command`. Configure your Slack 
 ```
 
 The selected mode is written to `config.json` in the project directory and takes effect on the next watcher run (unless overridden by the `--mode` CLI flag).
+
+## Mintlify formatting-error detection
+
+Sites listed in `MINTLIFY_URLS` (or in `personal_config.py` as `MINTLIFY_SITES`) are scanned on every crawl for Markdown save-corruption artifacts that Mintlify sometimes introduces — without waiting for a content-hash change to occur.
+
+Three patterns are detected:
+
+`Unrendered bold/italic` — raw `**text**` or `*text*` appearing in visible page content instead of rendered HTML, indicating Mintlify failed to process the Markdown.
+
+`Stray backslash` — a lone `` or `` immediately after a heading or at the end of a paragraph, a common artifact of Mintlify's autosave glitch.
+
+`Raw escape sequence` — literal `
+`, `	`, ``, or `` characters visible in body text (escaped source content leaking into the rendered page).
+
+When any of these are found, a separate alert is fired immediately — independent of whether the page hash changed — listing the affected URLs and a short snippet showing the matched text.
+
+To enable Mintlify checks for a site, add it to `MINTLIFY_URLS` in `.env`:
+
+```
+MINTLIFY_URLS=https://docs.example.com/,https://docs.anothersite.com/
+```
+
+Or add it to `MINTLIFY_SITES` in `personal_config.py`:
+
+```python
+MINTLIFY_SITES = [
+    "https://docs.example.com/",
+]
+```
 
 ## How it works
 

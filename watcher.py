@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-gemini-docs-watcher
+DiffLynx
 Crawls all sub-pages under each configured docs site, detects content changes,
 and sends alerts via Gmail (SMTP) and Slack (Bot Token).
 
@@ -9,12 +9,20 @@ Alert modes:
   digest   -- one Gmail + one Slack message listing all changed sites.
 
 Mode priority (highest wins): CLI --mode flag > config.json > .env ALERT_MODE.
+
+Mintlify formatting-error detection:
+  Sites listed in MINTLIFY_SITES (or MINTLIFY_URLS in .env) are additionally
+  scanned on every crawl for Markdown save-corruption patterns such as
+  unrendered **bold**, stray backslashes after section headings, and raw
+  escape sequences. Alerts are sent immediately when errors are found,
+  independent of content-hash changes.
 """
 
 import argparse
 import hashlib
 import json
 import os
+import re
 import smtplib
 import sys
 from email.mime.multipart import MIMEMultipart
@@ -39,15 +47,45 @@ SCRIPT_PATH = os.path.join(BASE_DIR, "watcher.py")
 # ---------------------------------------------------------------------------
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-DEFAULT_WATCH_URLS: List[str] = [
-    "https://geminicli.com/docs/",
-    "https://docs.tabnine.com",
-    "https://docs.github.com/en/copilot",
-    "https://cursor.com/docs",
-    "https://gitbook.com/docs",
-    "https://docs.slack.dev/",
-    "https://code.claude.com/docs/en/overview",
-    "https://developers.openai.com/codex",
+# Default lists are intentionally empty — configure your sites via WATCH_URLS
+# in .env, or populate personal_config.py (gitignored) for local defaults.
+DEFAULT_WATCH_URLS: List[str] = []
+
+# Sites to additionally scan for Mintlify Markdown save-corruption artifacts.
+# Can be extended via the MINTLIFY_URLS env var (comma-separated), or via
+# personal_config.py (gitignored).
+DEFAULT_MINTLIFY_SITES: List[str] = []
+
+# Load personal overrides if present (file is gitignored).
+try:
+    import personal_config as _pc  # type: ignore
+    DEFAULT_WATCH_URLS = list(getattr(_pc, "WATCH_URLS", DEFAULT_WATCH_URLS))
+    DEFAULT_MINTLIFY_SITES = list(getattr(_pc, "MINTLIFY_SITES", DEFAULT_MINTLIFY_SITES))
+except ImportError:
+    pass
+
+# Each tuple is (label, compiled_regex).  A match anywhere in the visible text
+# of a page signals a Mintlify formatting error.
+#
+# Pattern rationale:
+#   UNRENDERED_BOLD   -- Mintlify failed to render **text** → shows raw asterisks.
+#   TRAILING_BACKSLASH -- A lone \ or \\ appears immediately after a heading or
+#                         at the end of a paragraph (common Mintlify save glitch).
+#   RAW_ESCAPE_SEQ    -- Sequences like \n, \t, \r appearing as literal visible
+#                         characters in body text (escaped content leaked to HTML).
+MINTLIFY_ERROR_PATTERNS: List[Tuple[str, "re.Pattern[str]"]] = [
+    (
+        "Unrendered bold/italic Markdown (e.g. **text** or *text*)",
+        re.compile(r"\*{1,3}[^\s*][^*]*\*{1,3}", re.MULTILINE),
+    ),
+    (
+        "Stray backslash after heading or at paragraph end",
+        re.compile(r"(?m)(?:^#{1,6}\s.+|[.!?])\s*\\{1,2}\s*$"),
+    ),
+    (
+        "Raw escape sequence in visible text (\\n, \\t, \\r, \\\\)",
+        re.compile(r"\\[ntr\\]"),
+    ),
 ]
 
 VALID_MODES = {"per-site", "digest"}
@@ -114,6 +152,13 @@ def get_watch_urls() -> List[str]:
     return DEFAULT_WATCH_URLS
 
 
+def get_mintlify_sites() -> "set[str]":
+    """Return the set of base URLs that should receive Mintlify formatting checks."""
+    raw = os.environ.get("MINTLIFY_URLS", "").strip()
+    extra = {u.strip() for u in raw.split(",") if u.strip()} if raw else set()
+    return set(DEFAULT_MINTLIFY_SITES) | extra
+
+
 # ---------------------------------------------------------------------------
 # Credentials (loaded lazily so --dry-run can be used without real creds)
 # ---------------------------------------------------------------------------
@@ -124,6 +169,42 @@ def _require_env(name: str) -> str:
         print("[ERROR] Environment variable {} is not set.".format(name), file=sys.stderr)
         sys.exit(1)
     return val
+
+
+# ---------------------------------------------------------------------------
+# Mintlify formatting-error detection
+# ---------------------------------------------------------------------------
+
+def check_mintlify_formatting_errors(
+    html: str, url: str
+) -> List[Tuple[str, str]]:
+    """
+    Scan the visible text of *html* for Mintlify Markdown save-corruption
+    artifacts.  Returns a list of (error_label, matched_snippet) tuples; an
+    empty list means the page looks clean.
+
+    Only the visible text content is inspected (script/style tags are stripped)
+    so CSS class names or HTML attributes cannot trigger false positives.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Remove non-visible elements before extracting text.
+    for tag in soup(["script", "style", "head", "meta", "noscript"]):
+        tag.decompose()
+
+    visible_text = soup.get_text(separator="\n")
+    errors: List[Tuple[str, str]] = []
+
+    for label, pattern in MINTLIFY_ERROR_PATTERNS:
+        match = pattern.search(visible_text)
+        if match:
+            # Capture a short snippet (up to 120 chars) around the match.
+            start = max(0, match.start() - 30)
+            end = min(len(visible_text), match.end() + 30)
+            snippet = visible_text[start:end].strip().replace("\n", " ")
+            errors.append((label, snippet[:120]))
+
+    return errors
 
 
 # ---------------------------------------------------------------------------
@@ -158,9 +239,20 @@ def extract_doc_links(html: str, base_url: str, site_base: str) -> "set":
     return links
 
 
-def crawl_site(site_base: str) -> Dict[str, str]:
-    """Crawl all pages under site_base and return {url: sha256_hash}."""
+def crawl_site(
+    site_base: str, mintlify_check: bool = False
+) -> Tuple[Dict[str, str], Dict[str, List[Tuple[str, str]]]]:
+    """
+    Crawl all pages under site_base.
+
+    Returns:
+        hashes   -- {url: sha256_hash}
+        fmt_errors -- {url: [(error_label, snippet), ...]}
+                      Only populated when mintlify_check is True and errors
+                      are found; otherwise an empty dict.
+    """
     visited: Dict[str, str] = {}
+    fmt_errors: Dict[str, List[Tuple[str, str]]] = {}
     queue: List[str] = [site_base]
 
     while queue:
@@ -172,11 +264,17 @@ def crawl_site(site_base: str) -> Dict[str, str]:
             continue
         content_hash = hashlib.sha256(html.encode()).hexdigest()
         visited[url] = content_hash
+
+        if mintlify_check:
+            page_errors = check_mintlify_formatting_errors(html, url)
+            if page_errors:
+                fmt_errors[url] = page_errors
+
         for link in extract_doc_links(html, url, site_base):
             if link not in visited:
                 queue.append(link)
 
-    return visited
+    return visited, fmt_errors
 
 
 # ---------------------------------------------------------------------------
@@ -198,9 +296,8 @@ def load_snapshot() -> Dict[str, Dict[str, str]]:
     # Migration: if any top-level value is a string (not a dict) it's the old format.
     if data and isinstance(next(iter(data.values())), str):
         print("[INFO] Migrating legacy snapshot.json to multi-site format.")
-        migrated: Dict[str, Dict[str, str]] = {
-            "https://geminicli.com/docs/": data
-        }
+        legacy_key = DEFAULT_WATCH_URLS[0] if DEFAULT_WATCH_URLS else "unknown-site"
+        migrated: Dict[str, Dict[str, str]] = {legacy_key: data}
         save_snapshot(migrated)
         return migrated
 
@@ -277,6 +374,35 @@ def build_digest_message(
         if removed_pages:
             lines.append("  Removed ({}):".format(len(removed_pages)))
             lines.extend("    - {}".format(u) for u in sorted(removed_pages))
+        lines.append("")
+
+    body = "\n".join(lines) + EMAIL_FOOTER
+    return subject, body
+
+
+def build_formatting_error_message(
+    site: str,
+    fmt_errors: Dict[str, List[Tuple[str, str]]],
+) -> Tuple[str, str]:
+    """
+    Return (subject, body) for Mintlify formatting errors detected on *site*.
+
+    fmt_errors maps page_url -> [(error_label, snippet), ...].
+    """
+    total = sum(len(v) for v in fmt_errors.values())
+    subject = "Mintlify formatting error detected \u2014 {} ({} issue(s))".format(
+        site, total
+    )
+    lines = [
+        "Mintlify save-corruption artifacts detected on {}".format(site),
+        "Pages affected: {}".format(len(fmt_errors)),
+        "",
+    ]
+    for page_url in sorted(fmt_errors):
+        lines.append("  Page: {}".format(page_url))
+        for label, snippet in fmt_errors[page_url]:
+            lines.append("    Issue : {}".format(label))
+            lines.append("    Sample: ...{}...".format(snippet))
         lines.append("")
 
     body = "\n".join(lines) + EMAIL_FOOTER
@@ -391,7 +517,7 @@ def run_slack_server() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Docs watcher -- multi-site change detector."
+        description="DiffLynx -- multi-site docs change detector."
     )
     parser.add_argument(
         "--mode",
@@ -421,9 +547,13 @@ def main() -> None:
 
     mode = resolve_mode(args.mode)
     watch_urls = get_watch_urls()
+    mintlify_sites = get_mintlify_sites()
 
     print("[INFO] Alert mode: {}".format(mode))
     print("[INFO] Watching {} site(s).".format(len(watch_urls)))
+    print("[INFO] Mintlify formatting checks enabled for: {}".format(
+        ", ".join(sorted(mintlify_sites)) or "(none)"
+    ))
 
     # Load existing snapshot (migrates legacy format if needed)
     snapshot = load_snapshot()
@@ -431,15 +561,25 @@ def main() -> None:
     # Determine if this is the first-ever run (no snapshot at all)
     first_run = not snapshot
 
-    # Crawl every site and collect diffs
+    # Crawl every site and collect diffs + formatting errors
     new_snapshot: Dict[str, Dict[str, str]] = {}
     site_diffs: Dict[str, Tuple[List[str], List[str], List[str]]] = {}
+    all_fmt_errors: Dict[str, Dict[str, List[Tuple[str, str]]]] = {}
 
     for site in watch_urls:
-        print("[INFO] Crawling {} ...".format(site))
-        current = crawl_site(site)
+        is_mintlify = site in mintlify_sites
+        print("[INFO] Crawling {} {}...".format(
+            site, "(+ Mintlify check)" if is_mintlify else ""
+        ))
+        current, fmt_errors = crawl_site(site, mintlify_check=is_mintlify)
         print("[INFO]   Found {} page(s) under {}.".format(len(current), site))
         new_snapshot[site] = current
+
+        if fmt_errors:
+            all_fmt_errors[site] = fmt_errors
+            print("[WARN]   Mintlify formatting errors found on {} page(s) of {}.".format(
+                len(fmt_errors), site
+            ))
 
         old_site = snapshot.get(site, {})
 
@@ -456,12 +596,30 @@ def main() -> None:
     # Persist updated snapshot (regardless of dry-run so baseline is always written)
     save_snapshot(new_snapshot)
 
+    # ------------------------------------------------------------------
+    # Mintlify formatting-error alerts (fired every run errors are found,
+    # independent of content-hash changes)
+    # ------------------------------------------------------------------
+    if all_fmt_errors:
+        for site, fmt_errors in all_fmt_errors.items():
+            subject, body = build_formatting_error_message(site, fmt_errors)
+            print("\n[FORMATTING ERROR] {}\n{}".format(subject, body))
+            if not args.dry_run:
+                send_gmail(subject, body)
+                send_slack("*{}*\n```\n{}\n```".format(subject, body))
+
+    if args.dry_run and all_fmt_errors:
+        print("[DRY-RUN] Formatting-error alerts not sent.")
+
+    # ------------------------------------------------------------------
+    # Content-change alerts
+    # ------------------------------------------------------------------
     if first_run or not any(snapshot.values()):
-        print("[INFO] No previous snapshot existed. Baseline saved. No alert sent.")
+        print("[INFO] No previous snapshot existed. Baseline saved. No change alert sent.")
         return
 
     if not site_diffs:
-        print("[INFO] No changes detected across all sites.")
+        print("[INFO] No content changes detected across all sites.")
         return
 
     # Print diffs
@@ -472,7 +630,7 @@ def main() -> None:
         print(body)
 
     if args.dry_run:
-        print("[DRY-RUN] No alerts sent.")
+        print("[DRY-RUN] No change alerts sent.")
         return
 
     # Send alerts
